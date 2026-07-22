@@ -1,0 +1,198 @@
+# ==============================================================
+# AI漫剧 - Docker Compose 全栈部署配置
+# ==============================================================
+
+version: "3.9"
+
+services:
+  # ──── Nginx 反向代理 + 前端静态文件 ────
+  nginx:
+    image: ${DOCKER_REGISTRY:-ghcr.io}/${DOCKER_USERNAME:-user}/ai-comic-drama-frontend:${VERSION:-latest}
+    container_name: ai-comic-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - media_volume:/app/media:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - app-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ──── FastAPI 后端 ────
+  backend:
+    image: ${DOCKER_REGISTRY:-ghcr.io}/${DOCKER_USERNAME:-user}/ai-comic-drama-backend:${VERSION:-latest}
+    container_name: ai-comic-backend
+    restart: unless-stopped
+    env_file:
+      - .env.deploy
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ai_comic_drama}
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - media_volume:/app/media
+      - ./backend/logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ──── 定时任务 Worker（剧本自动生成、视频合成等） ────
+  worker:
+    image: ${DOCKER_REGISTRY:-ghcr.io}/${DOCKER_USERNAME:-user}/ai-comic-drama-backend:${VERSION:-latest}
+    container_name: ai-comic-worker
+    restart: unless-stopped
+    command: celery -A app.tasks worker --loglevel=info --concurrency=2
+    env_file:
+      - .env.deploy
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ai_comic_drama}
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - media_volume:/app/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2"
+    networks:
+      - app-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ──── Celery Beat 定时调度 ────
+  beat:
+    image: ${DOCKER_REGISTRY:-ghcr.io}/${DOCKER_USERNAME:-user}/ai-comic-drama-backend:${VERSION:-latest}
+    container_name: ai-comic-beat
+    restart: unless-stopped
+    command: celery -A app.tasks beat --loglevel=info
+    env_file:
+      - .env.deploy
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ai_comic_drama}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  # ──── PostgreSQL 数据库 ────
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-comic-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-ai_comic_drama}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/init-db:/docker-entrypoint-initdb.d:ro
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB:-ai_comic_drama}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ──── Redis 缓存 ────
+  redis:
+    image: redis:7-alpine
+    container_name: ai-comic-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ──── 数据库自动备份 ────
+  backup:
+    image: postgres:16-alpine
+    container_name: ai-comic-backup
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - PGPASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-ai_comic_drama}
+      - BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
+      - BACKUP_S3_ENDPOINT=${BACKUP_S3_ENDPOINT:-}
+    volumes:
+      - backup_data:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          echo "Backup starting at $$(date)"
+          pg_dump -h postgres -U $$POSTGRES_USER -d $$POSTGRES_DB -F c \
+            -f /backups/ai_comic_$$(date +%Y%m%d_%H%M%S).dump
+          # 保留最近7天备份
+          find /backups -name "*.dump" -mtime +7 -delete
+          sleep 86400
+        done
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  media_volume:
+  backup_data:
+
+networks:
+  app-network:
+    driver: bridge
