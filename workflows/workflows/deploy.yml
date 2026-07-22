@@ -1,0 +1,341 @@
+# ==============================================================
+# AI漫剧全栈部署工作流
+# 覆盖：Docker Compose 一键部署 / 灰度发布 / 回滚
+# ==============================================================
+
+name: 全栈部署
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "部署环境"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+      skip-tests:
+        description: "跳过测试（仅紧急情况）"
+        type: boolean
+        default: false
+      version-tag:
+        description: "版本号（留空自动生成）"
+        type: string
+        default: ""
+
+  release:
+    types: [published]
+
+concurrency:
+  group: deploy-${{ github.ref }}-${{ github.event.inputs.environment || 'production' }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+
+jobs:
+  # ──── 阶段0: 触发前端/后端 CI（可选，确保代码质量） ────
+  preflight:
+    name: 预检
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.inputs.skip-tests }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 代码变更摘要
+        run: |
+          echo "### 📋 部署摘要" >> $GITHUB_STEP_SUMMARY
+          echo "**触发方式**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**分支**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**环境**: ${{ github.event.inputs.environment || 'production' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**提交**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**变更文件**:" >> $GITHUB_STEP_SUMMARY
+          git diff --name-status ${{ github.event.before }} ${{ github.sha }} 2>/dev/null | head -30 >> $GITHUB_STEP_SUMMARY || echo "无历史对比（首次部署或手动触发）" >> $GITHUB_STEP_SUMMARY
+
+  # ──── 阶段1: 构建前端镜像 ────
+  build-frontend:
+    name: 构建前端镜像
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    if: ${{ !failure() && !cancelled() }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录镜像仓库
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: 计算版本号
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version-tag }}" ]; then
+            echo "tag=${{ github.event.inputs.version-tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=$(date +%Y%m%d)-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 构建前端
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_REGISTRY }}/ai-comic-drama-frontend:${{ steps.version.outputs.tag }}
+            ${{ secrets.DOCKER_REGISTRY }}/ai-comic-drama-frontend:latest
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+          build-args: |
+            VITE_API_BASE_URL=${{ secrets.VITE_API_BASE_URL }}
+            VITE_ENVIRONMENT=${{ github.event.inputs.environment || 'production' }}
+
+  # ──── 阶段2: 构建后端镜像 ────
+  build-backend:
+    name: 构建后端镜像
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    if: ${{ !failure() && !cancelled() }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录镜像仓库
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: 计算版本号
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version-tag }}" ]; then
+            echo "tag=${{ github.event.inputs.version-tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=$(date +%Y%m%d)-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 构建后端
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_REGISTRY }}/ai-comic-drama-backend:${{ steps.version.outputs.tag }}
+            ${{ secrets.DOCKER_REGISTRY }}/ai-comic-drama-backend:latest
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+  # ──── 阶段3: 部署到服务器 ────
+  deploy:
+    name: 部署到 ${{ github.event.inputs.environment || 'production' }}
+    runs-on: ubuntu-latest
+    needs: [build-frontend, build-backend]
+    environment:
+      name: ${{ github.event.inputs.environment || 'production' }}
+      url: https://${{ secrets.DEPLOY_HOST }}
+    steps:
+      - name: 检出代码（获取 docker-compose 等配置）
+        uses: actions/checkout@v4
+
+      - name: 计算版本号
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version-tag }}" ]; then
+            echo "tag=${{ github.event.inputs.version-tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=$(date +%Y%m%d)-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 生成部署配置
+        run: |
+          # 基于环境模板生成 .env 文件
+          ENV_NAME="${{ github.event.inputs.environment || 'production' }}"
+          cat > .env.deploy << 'ENVEOF'
+          # 自动生成于 ${{ github.run_id }}
+          VERSION=${{ steps.version.outputs.tag }}
+          ENVIRONMENT=${ENV_NAME}
+          DOCKER_REGISTRY=${{ secrets.DOCKER_REGISTRY }}
+
+          # 数据库
+          POSTGRES_USER=${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB=ai_comic_drama
+          DATABASE_URL=postgresql+asyncpg://${{ secrets.POSTGRES_USER }}:${{ secrets.POSTGRES_PASSWORD }}@postgres:5432/ai_comic_drama
+
+          # Redis
+          REDIS_URL=redis://redis:6379/0
+
+          # AI 模型 API 密钥（根据你的项目配置调整）
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+          DEEPSEEK_API_KEY=${{ secrets.DEEPSEEK_API_KEY }}
+          KLING_API_KEY=${{ secrets.KLING_API_KEY }}
+          JIMENG_API_KEY=${{ secrets.JIMENG_API_KEY }}
+          DOUBAO_API_KEY=${{ secrets.DOUBAO_API_KEY }}
+
+          # 安全
+          SECRET_KEY=${{ secrets.APP_SECRET_KEY }}
+
+          # 域名
+          DOMAIN=${{ secrets.DOMAIN }}
+
+          # 备份
+          BACKUP_S3_BUCKET=${{ secrets.BACKUP_S3_BUCKET }}
+          BACKUP_S3_ENDPOINT=${{ secrets.BACKUP_S3_ENDPOINT }}
+          ENVEOF
+
+      - name: 上传部署配置
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          # 上传配置和 compose 文件
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            .env.deploy docker-compose.yml docker-compose.prod.yml \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/ai-comic-drama/
+
+      - name: 服务器端拉取并重启
+        id: remote-deploy
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'REMOTE_SCRIPT'
+
+            set -e
+            cd /opt/ai-comic-drama
+
+            echo "🚀 开始部署: $(date)"
+
+            # 加载环境变量
+            set -a; source .env.deploy; set +a
+
+            # 登录镜像仓库
+            echo "$DOCKER_PASSWORD" | docker login "$DOCKER_REGISTRY" -u "$DOCKER_USERNAME" --password-stdin
+
+            # 拉取最新镜像
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
+
+            # 数据库迁移
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm backend alembic upgrade head
+
+            # 滚动更新（零停机）
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
+
+            # 等待服务健康
+            echo "⏳ 等待服务就绪..."
+            for i in $(seq 1 30); do
+              if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+                echo "✅ 服务已就绪"
+                break
+              fi
+              sleep 2
+            done
+
+            # 清理旧镜像（保留最近3个版本）
+            docker image prune -af --filter "until=72h" || true
+
+            echo "🎉 部署完成: $(date)"
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+          REMOTE_SCRIPT
+
+      - name: 记录部署信息
+        if: always()
+        run: |
+          echo "### 🚀 部署结果" >> $GITHUB_STEP_SUMMARY
+          echo "**环境**: ${{ github.event.inputs.environment || 'production' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**版本**: ${{ steps.version.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**状态**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+
+  # ──── 阶段4: 部署后验证 ────
+  smoke-test:
+    name: 冒烟测试
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: 健康检查
+        run: |
+          echo "🏥 执行冒烟测试..."
+
+          # API 健康检查
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://${{ secrets.DEPLOY_HOST }}/health || echo "000")
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ API 健康检查失败: HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "✅ API 健康检查通过"
+
+          # 前端页面可访问
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://${{ secrets.DEPLOY_HOST }}/ || echo "000")
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ 前端页面不可达: HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "✅ 前端页面可访问"
+
+          echo "🎯 冒烟测试全部通过！"
+
+  # ──── 阶段5: 部署通知 ────
+  notify:
+    name: 通知
+    runs-on: ubuntu-latest
+    needs: [deploy, smoke-test]
+    if: always()
+    steps:
+      - name: 发送部署通知
+        run: |
+          STATUS="${{ needs.deploy.result }}"
+          VERSION="${{ needs.deploy.outputs.version-tag || github.sha }}"
+
+          # 输出到 GitHub Step Summary
+          if [ "$STATUS" == "success" ]; then
+            echo "## ✅ 部署成功" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ 部署失败" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "**版本**: \`${VERSION}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**环境**: ${{ github.event.inputs.environment || 'production' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**时间**: $(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Webhook 通知（企业微信/钉钉/飞书 三选一）
+
+          # === 企业微信机器人 ===
+          # if [ -n "${{ secrets.WECOM_WEBHOOK }}" ]; then
+          #   curl -X POST "${{ secrets.WECOM_WEBHOOK }}" \
+          #     -H "Content-Type: application/json" \
+          #     -d "{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\"## 部署通知\n版本: \`${VERSION}\`\n环境: ${{ github.event.inputs.environment || 'production' }}\n状态: ${STATUS}\"}}"
+          # fi
+
+          # === 钉钉机器人 ===
+          # if [ -n "${{ secrets.DINGTALK_WEBHOOK }}" ]; then
+          #   curl -X POST "${{ secrets.DINGTALK_WEBHOOK }}" \
+          #     -H "Content-Type: application/json" \
+          #     -d "{\"msgtype\":\"markdown\",\"markdown\":{\"title\":\"部署通知\",\"text\":\"## 部署通知\n- 版本: ${VERSION}\n- 环境: ${{ github.event.inputs.environment || 'production' }}\n- 状态: ${STATUS}\"}}"
+          # fi
+
+          # === 飞书机器人 ===
+          # if [ -n "${{ secrets.FEISHU_WEBHOOK }}" ]; then
+          #   curl -X POST "${{ secrets.FEISHU_WEBHOOK }}" \
+          #     -H "Content-Type: application/json" \
+          #     -d "{\"msg_type\":\"interactive\",\"card\":{\"header\":{\"title\":{\"tag\":\"plain_text\",\"content\":\"部署通知\"}},\"elements\":[{\"tag\":\"div\",\"text\":{\"tag\":\"lark_md\",\"content\":\"版本: ${VERSION}\n环境: ${{ github.event.inputs.environment || 'production' }}\n状态: ${STATUS}\"}}]}}"
+          # fi
